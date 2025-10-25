@@ -1,0 +1,290 @@
+name: Persistent VPS with Account Backup
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # يعيد التشغيل كل 6 ساعات
+
+jobs:
+  vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Setup Persistent VPS with Account Backup
+        run: |
+          # تعريف المتغيرات
+          BACKUP_FILE="/tmp/vps_accounts.backup"
+          CONFIG_DIR="/tmp/vps_config"
+          LOG_FILE="/tmp/vps_connection.log"
+          
+          # إنشاء مجلد التكوين
+          mkdir -p $CONFIG_DIR
+          
+          # دالة لحفظ معلومات الحساب
+          backup_accounts() {
+            echo "💾 Backing up account information..."
+            TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+            
+            # حفظ معلومات النظام
+            {
+              echo "=== VPS ACCOUNT BACKUP - $TIMESTAMP ==="
+              echo "VPS_ID: vps-${{ github.run_id }}"
+              echo "CREATED_AT: $(date)"
+              echo "GITHUB_RUN_ID: ${{ github.run_id }}"
+              echo "TAILSCALE_AUTH: ${{ secrets.TAILSCALE_AUTH_KEY != '' }}"
+              
+              # معلومات SSH
+              echo "SSH_ROOT_PASSWORD: admin@123"
+              echo "SSH_PORT: 22"
+              
+              # معلومات الشبكة
+              echo "PUBLIC_IP: $(curl -s ifconfig.me || echo 'N/A')"
+              echo "TAILSCALE_IP: $(tailscale ip -4 2>/dev/null || echo 'NOT_CONNECTED')"
+              echo "HOSTNAME: $(hostname)"
+              
+              # معلومات النظام
+              echo "OS: $(lsb_release -d | cut -f2)"
+              echo "KERNEL: $(uname -r)"
+              echo "UPTIME: $(uptime -p)"
+              
+              # خدمات نشطة
+              echo "ACTIVE_SERVICES:"
+              systemctl list-units --type=service --state=running | grep -E "(ssh|tailscale)" | awk '{print "  - " $1}'
+              
+              echo "=== END BACKUP ==="
+            } > "$BACKUP_FILE.$TIMESTAMP"
+            
+            # نسخ إلى الموقع الدائم
+            cp "$BACKUP_FILE.$TIMESTAMP" "$BACKUP_FILE"
+            cp "$BACKUP_FILE" "$CONFIG_DIR/vps_accounts.current"
+            
+            echo "✅ Accounts backed up to: $BACKUP_FILE"
+          }
+
+          # دالة لاستعادة المعلومات
+          restore_accounts() {
+            if [ -f "$BACKUP_FILE" ]; then
+              echo "🔄 Restoring previous account information..."
+              echo "=== PREVIOUS SESSION INFO ==="
+              cat "$BACKUP_FILE"
+              echo "=== END PREVIOUS INFO ==="
+              
+              # استخراج المعلومات المهمة
+              PREVIOUS_TS_IP=$(grep "TAILSCALE_IP:" "$BACKUP_FILE" | cut -d':' -f2- | tr -d ' ')
+              PREVIOUS_VPS_ID=$(grep "VPS_ID:" "$BACKUP_FILE" | cut -d':' -f2- | tr -d ' ')
+              
+              echo "🔗 Previous Tailscale IP: $PREVIOUS_TS_IP"
+              echo "🆔 Previous VPS ID: $PREVIOUS_VPS_ID"
+            else
+              echo "📝 No previous backup found - fresh start"
+            fi
+          }
+
+          # دالة لحفظ معلومات الاتصال الحالية
+          save_connection_info() {
+            echo "📝 Saving current connection info..."
+            CURRENT_TS_IP=$(tailscale ip -4 2>/dev/null || echo "DISCONNECTED")
+            CURRENT_TS_STATUS=$(tailscale status --json 2>/dev/null | jq -r '.BackendState' 2>/dev/null || echo "OFFLINE")
+            
+            {
+              echo "=== CURRENT CONNECTION STATUS ==="
+              echo "TIMESTAMP: $(date)"
+              echo "TAILSCALE_IP: $CURRENT_TS_IP"
+              echo "TAILSCALE_STATUS: $CURRENT_TS_STATUS"
+              echo "SSH_STATUS: $(systemctl is-active ssh)"
+              echo "PUBLIC_IP: $(curl -s ifconfig.me || echo 'N/A')"
+              echo "=== END CURRENT STATUS ==="
+            } > "$CONFIG_DIR/connection_status.txt"
+          }
+
+          # دالة لتسجيل أحداث الاتصال
+          log_connection_event() {
+            EVENT=$1
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] $EVENT" >> "$LOG_FILE"
+          }
+
+          # دالة لعرض معلومات الحساب للمستخدم
+          display_account_info() {
+            echo ""
+            echo "🔐 ================================="
+            echo "🔐 VPS ACCOUNT INFORMATION"
+            echo "🔐 ================================="
+            echo "👤 SSH Username: root"
+            echo "🔑 SSH Password: admin@123"
+            echo "🔗 SSH Command: ssh root@$(tailscale ip -4 2>/dev/null || echo 'TAILSCALE_IP')"
+            echo "🌐 Tailscale IP: $(tailscale ip -4 2>/dev/null || echo 'Connecting...')"
+            echo "📡 Public IP: $(curl -s ifconfig.me || echo 'N/A')"
+            echo "🆔 VPS ID: vps-${{ github.run_id }}"
+            echo "⏰ Started: $(date)"
+            echo "💾 Backup: $BACKUP_FILE"
+            echo "🔐 ================================="
+            echo ""
+          }
+
+          # دالة الإعداد الأولي
+          initial_setup() {
+            echo "⚙️ Performing initial VPS setup..."
+            
+            # استعادة المعلومات السابقة
+            restore_accounts
+            
+            # تحديث النظام
+            sudo apt update -y
+            sudo apt install -y openssh-server curl jq
+            
+            # تكوين SSH
+            echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config
+            echo "PasswordAuthentication yes" | sudo tee -a /etc/ssh/sshd_config
+            echo "root:admin@123" | sudo chpasswd
+            sudo systemctl enable ssh
+            sudo systemctl start ssh
+            
+            # تثبيت وتكوين Tailscale
+            curl -fsSL https://tailscale.com/install.sh | sh
+            sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=persistent-vps-${{ github.run_id }} --accept-dns=false
+            
+            # حفظ المعلومات الأولية
+            backup_accounts
+            save_connection_info
+            display_account_info
+            
+            log_connection_event "VPS_INITIALIZED"
+          }
+
+          # دالة إعادة الاتصال الذكي
+          reconnect_services() {
+            echo "🔄 Attempting to reconnect services..."
+            
+            # إعادة تشغيل SSH إذا توقف
+            if ! sudo systemctl is-active --quiet ssh; then
+              echo "🔧 Restarting SSH service..."
+              sudo systemctl restart ssh
+              log_connection_event "SSH_RESTARTED"
+            fi
+            
+            # إعادة الاتصال بـ Tailscale
+            TS_STATUS=$(tailscale status --json 2>/dev/null | jq -r '.BackendState' 2>/dev/null || echo "disconnected")
+            if [ "$TS_STATUS" != "Running" ]; then
+              echo "🔗 Reconnecting Tailscale..."
+              sudo tailscale up --reset --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --accept-dns=false
+              log_connection_event "TAILSCALE_RECONNECTED"
+            fi
+            
+            # تحديث معلومات الحساب
+            backup_accounts
+            save_connection_info
+          }
+
+          # دالة لعرض الإحصائيات
+          show_stats() {
+            echo "📊 Connection Statistics:"
+            echo "⏰ Uptime: $(uptime -p)"
+            echo "🔗 Reconnect attempts: $(grep -c "RECONNECT" $LOG_FILE 2>/dev/null || echo 0)"
+            echo "📝 Log entries: $(wc -l < $LOG_FILE 2>/dev/null || echo 0)"
+            echo "💾 Backup files: $(ls -1 $CONFIG_DIR/*.backup 2>/dev/null | wc -l || echo 0)"
+          }
+
+          # التنفيذ الرئيسي
+          echo "🚀 Starting Persistent VPS with Account Backup..."
+          initial_setup
+
+          # Loop المراقبة الرئيسي
+          SESSION_START=$SECONDS
+          MAX_DURATION=21000  # 350 دقيقة
+          CHECK_INTERVAL=300  # 5 دقائق
+          CONSECUTIVE_FAILURES=0
+          MAX_CONSECUTIVE_FAILURES=3
+
+          while [ $((SECONDS - SESSION_START)) -lt $MAX_DURATION ]; do
+            CURRENT_TIME=$SECONDS
+            ELAPSED_MINUTES=$(( (CURRENT_TIME - SESSION_START) / 60 ))
+            REMAINING_MINUTES=$(( (MAX_DURATION - (CURRENT_TIME - SESSION_START)) / 60 ))
+            
+            echo ""
+            echo "=========================================="
+            echo "🕐 Elapsed: ${ELAPSED_MINUTES}m | Remaining: ${REMAINING_MINUTES}m"
+            echo "=========================================="
+            
+            # عرض معلومات الحساب الحالية
+            display_account_info
+            
+            # التحقق من حالة الخدمات
+            SSH_ACTIVE=$(sudo systemctl is-active ssh)
+            TAILSCALE_ACTIVE=$(tailscale status --json 2>/dev/null | jq -r '.BackendState' 2>/dev/null)
+            TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "DISCONNECTED")
+            
+            echo "🔍 Service Status:"
+            echo "  🔌 SSH: $SSH_ACTIVE"
+            echo "  🌐 Tailscale: $TAILSCALE_ACTIVE"
+            echo "  📡 Tailscale IP: $TAILSCALE_IP"
+            
+            # التحقق من المشاكل وإعادة الاتصال
+            if [ "$SSH_ACTIVE" != "active" ] || [ "$TAILSCALE_ACTIVE" != "Running" ]; then
+              echo "⚠️ Service issues detected!"
+              CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+              log_connection_event "SERVICE_ISSUE_DETECTED_FAILURE_$CONSECUTIVE_FAILURES"
+              
+              if [ $CONSECUTIVE_FAILURES -ge $MAX_CONSECUTIVE_FAILURES ]; then
+                echo "🚨 Critical failure - performing emergency recovery..."
+                reconnect_services
+                CONSECUTIVE_FAILURES=0
+                log_connection_event "EMERGENCY_RECOVERY_EXECUTED"
+              else
+                echo "🔧 Attempting service recovery..."
+                reconnect_services
+              fi
+            else
+              if [ $CONSECUTIVE_FAILURES -gt 0 ]; then
+                echo "✅ Services restored to normal"
+                CONSECUTIVE_FAILURES=0
+                log_connection_event "SERVICES_RECOVERED"
+              fi
+            fi
+            
+            # حفظ نسخة احتياطية دورية
+            if [ $((ELAPSED_MINUTES % 30)) -eq 0 ]; then  # كل 30 دقيقة
+              backup_accounts
+              echo "💾 Periodic backup completed"
+            fi
+            
+            # عرض الإحصائيات
+            show_stats
+            
+            echo "💤 Next check in 5 minutes..."
+            sleep $CHECK_INTERVAL
+          done
+
+          # التنظيف النهائي وحفظ المعلومات
+          echo "🎯 Session completed - saving final state..."
+          backup_accounts
+          save_connection_info
+          log_connection_event "SESSION_COMPLETED_SUCCESSFULLY"
+          
+          echo ""
+          echo "✅ ================================="
+          echo "✅ VPS Session Completed Successfully"
+          echo "✅ ================================="
+          echo "📊 Final Statistics:"
+          show_stats
+          echo "🔁 Next auto-reconnect in 6 hours"
+          echo "💾 Account info saved in: $CONFIG_DIR"
+
+      - name: Upload Account Backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-accounts-backup
+          path: |
+            /tmp/vps_accounts.backup
+            /tmp/vps_config/
+          retention-days: 30
+
+      - name: Display Final Connection Info
+        if: always()
+        run: |
+          echo "🔐 FINAL CONNECTION INFORMATION:"
+          echo "================================="
+          if [ -f "/tmp/vps_accounts.backup" ]; then
+            cat "/tmp/vps_accounts.backup"
+          else
+            echo "No backup file found - session may have failed early"
+          fi
